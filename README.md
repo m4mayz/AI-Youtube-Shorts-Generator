@@ -95,6 +95,10 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    MUAPI_API_KEY=your_muapi_key_here
 
    # Local mode (--mode local)
+   TRANSCRIBER_PROVIDER=faster-whisper # faster-whisper or groq
+   GROQ_API_KEY=your_groq_key_here      # required when provider=groq
+   GROQ_API_KEYS=key1,key2,key3         # optional fallback chain
+   GROQ_TRANSCRIBE_MODEL=whisper-large-v3
    LLM_PROVIDER=openai         # openai or gemini
    OPENAI_API_KEY=your_openai_key_here
    OPENAI_MODEL=gpt-4o-mini          # optional, default gpt-4o-mini

@@ -5,17 +5,32 @@ expects: {duration, segments[start, end, text]}.
 """
 import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Dict, Optional
 
-from ..config import LOCAL_OUTPUT_DIR, LOCAL_WHISPER_DEVICE, LOCAL_WHISPER_MODEL
+from ..config import (
+    GROQ_BASE_URL,
+    GROQ_TRANSCRIBE_MODEL,
+    LOCAL_FFMPEG_PATH,
+    LOCAL_OUTPUT_DIR,
+    LOCAL_WHISPER_DEVICE,
+    LOCAL_WHISPER_MODEL,
+    TRANSCRIBER_PROVIDER,
+    require_groq_keys,
+)
 
 
-def _transcript_cache_path(media_path: str) -> Path:
+_GROQ_CHUNK_SECONDS = 1800
+
+
+def _transcript_cache_path(media_path: str, provider: str = "faster-whisper") -> Path:
     """Return the .srt cache path for a media file."""
     cache_dir = Path(LOCAL_OUTPUT_DIR)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / (Path(media_path).stem + ".srt")
+    suffix = ".groq.srt" if provider == "groq" else ".srt"
+    return cache_dir / (Path(media_path).stem + suffix)
 
 
 def _format_srt_timestamp(seconds: float) -> str:
@@ -37,8 +52,8 @@ def _parse_srt_timestamp(value: str) -> float:
     return hours * 3600 + minutes * 60 + seconds + (millis / 1000.0)
 
 
-def _write_srt_cache(media_path: str, transcript: Dict) -> Path:
-    cache_path = _transcript_cache_path(media_path)
+def _write_srt_cache(media_path: str, transcript: Dict, provider: str) -> Path:
+    cache_path = _transcript_cache_path(media_path, provider)
     lines = []
     for idx, segment in enumerate(transcript.get("segments", []), start=1):
         start = _format_srt_timestamp(float(segment["start"]))
@@ -95,9 +110,114 @@ def _resolve_device() -> str:
     return "cpu"
 
 
+def _groq_segments(response, offset: float) -> list:
+    """Normalize Groq SDK segments and restore source-video timestamps."""
+    raw_segments = getattr(response, "segments", None)
+    if raw_segments is None and isinstance(response, dict):
+        raw_segments = response.get("segments")
+
+    segments = []
+    for segment in raw_segments or []:
+        if isinstance(segment, dict):
+            start, end, text = segment.get("start"), segment.get("end"), segment.get("text")
+        else:
+            start = getattr(segment, "start", None)
+            end = getattr(segment, "end", None)
+            text = getattr(segment, "text", "")
+        if start is None or end is None:
+            continue
+        segments.append({
+            "start": float(start) + offset,
+            "end": float(end) + offset,
+            "text": str(text or "").strip(),
+        })
+    return segments
+
+
+def _is_retryable_groq_error(error: Exception) -> bool:
+    """Only rotate credentials for failures another key can plausibly fix."""
+    status_code = getattr(error, "status_code", None)
+    if status_code in {401, 403, 408, 409, 429, 500, 502, 503, 504}:
+        return True
+    return error.__class__.__name__ in {
+        "APIConnectionError",
+        "APITimeoutError",
+        "InternalServerError",
+        "RateLimitError",
+    }
+
+
+def _transcribe_groq(media_path: str, language: Optional[str]) -> Dict:
+    try:
+        from openai import OpenAI
+    except ImportError as error:
+        raise RuntimeError("Install local dependencies with: pip install -r requirements-local.txt") from error
+
+    keys = require_groq_keys()
+    clients = [OpenAI(api_key=key, base_url=GROQ_BASE_URL) for key in keys]
+    active_key = 0
+    print(
+        f"[transcribe/groq] model={GROQ_TRANSCRIBE_MODEL} keys={len(keys)}",
+        flush=True,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="groq_transcribe_") as temp_dir:
+        chunk_pattern = str(Path(temp_dir) / "chunk_%03d.mp3")
+        subprocess.run([
+            LOCAL_FFMPEG_PATH, "-y", "-loglevel", "error",
+            "-i", media_path,
+            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+            "-c:a", "libmp3lame", "-b:a", "64k",
+            "-f", "segment", "-segment_time", str(_GROQ_CHUNK_SECONDS),
+            "-reset_timestamps", "1", chunk_pattern,
+        ], check=True)
+
+        chunks = sorted(Path(temp_dir).glob("chunk_*.mp3"))
+        if not chunks:
+            raise RuntimeError("FFmpeg extracted no audio for Groq transcription.")
+
+        segments = []
+        for index, chunk_path in enumerate(chunks):
+            print(f"[transcribe/groq] chunk {index + 1}/{len(chunks)}", flush=True)
+            while True:
+                try:
+                    with chunk_path.open("rb") as audio_file:
+                        request = {
+                            "file": audio_file,
+                            "model": GROQ_TRANSCRIBE_MODEL,
+                            "response_format": "verbose_json",
+                            "timestamp_granularities": ["segment"],
+                            "temperature": 0,
+                        }
+                        if language:
+                            request["language"] = language
+                        response = clients[active_key].audio.transcriptions.create(**request)
+                    break
+                except Exception as error:
+                    if not _is_retryable_groq_error(error) or active_key + 1 >= len(clients):
+                        raise
+                    active_key += 1
+                    print(
+                        f"[transcribe/groq] key failed; switching to "
+                        f"{active_key + 1}/{len(clients)}",
+                        flush=True,
+                    )
+            # ponytail: fixed chunks can split one word; add overlap/dedup only
+            # if real transcripts show errors at the 30-minute boundaries.
+            segments.extend(_groq_segments(response, index * _GROQ_CHUNK_SECONDS))
+
+    duration = segments[-1]["end"] if segments else 0.0
+    print(f"[transcribe/groq] {len(segments)} segments, {duration:.0f}s of audio", flush=True)
+    return {"duration": duration, "segments": segments}
+
+
 def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
-    """Run faster-whisper on a local file path, caching the result as .srt."""
-    cache_path = _transcript_cache_path(media_path)
+    """Transcribe a local file with the configured provider and cache as SRT."""
+    provider = TRANSCRIBER_PROVIDER
+    if provider not in {"faster-whisper", "groq"}:
+        raise ValueError("TRANSCRIBER_PROVIDER must be 'faster-whisper' or 'groq'.")
+
+    cache_path = _transcript_cache_path(media_path, provider)
     if cache_path.exists():
         source_mtime = os.path.getmtime(media_path)
         cache_mtime = cache_path.stat().st_mtime
@@ -115,6 +235,12 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
                     flush=True,
                 )
                 return cached
+
+    if provider == "groq":
+        transcript = _transcribe_groq(media_path, language)
+        cache_path = _write_srt_cache(media_path, transcript, provider)
+        print(f"[transcribe/groq] wrote cache: {cache_path}", flush=True)
+        return transcript
 
     try:
         from faster_whisper import WhisperModel  # type: ignore
@@ -157,6 +283,6 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
     duration = float(getattr(info, "duration", 0.0)) or (segments[-1]["end"] if segments else 0.0)
     print(f"[transcribe/local] {len(segments)} segments, {duration:.0f}s of audio", flush=True)
     transcript = {"duration": duration, "segments": segments}
-    cache_path = _write_srt_cache(media_path, transcript)
+    cache_path = _write_srt_cache(media_path, transcript, provider)
     print(f"[transcribe/local] wrote cache: {cache_path}", flush=True)
     return transcript

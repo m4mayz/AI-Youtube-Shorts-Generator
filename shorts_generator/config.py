@@ -11,6 +11,15 @@ POLL_INTERVAL_SECONDS = float(os.getenv("MUAPI_POLL_INTERVAL", "5"))
 POLL_TIMEOUT_SECONDS = float(os.getenv("MUAPI_POLL_TIMEOUT", "600"))
 
 # Local-mode (--mode local) settings — only consulted when running offline.
+TRANSCRIBER_PROVIDER = os.getenv("TRANSCRIBER_PROVIDER", "faster-whisper").strip().lower()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_API_KEYS = tuple(dict.fromkeys(
+    key.strip()
+    for key in (os.getenv("GROQ_API_KEYS", "").split(",") + [GROQ_API_KEY])
+    if key.strip()
+))
+GROQ_TRANSCRIBE_MODEL = os.getenv("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3").strip()
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -67,3 +76,12 @@ def require_gemini_key() -> str:
             "Add it to your .env or export it, or switch LLM_PROVIDER back to openai."
         )
     return GEMINI_API_KEY
+
+
+def require_groq_keys() -> tuple:
+    if not GROQ_API_KEYS:
+        raise RuntimeError(
+            "GROQ_API_KEY or GROQ_API_KEYS is not set. Add one to your .env when "
+            "TRANSCRIBER_PROVIDER=groq."
+        )
+    return GROQ_API_KEYS
